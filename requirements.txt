@@ -1,0 +1,5 @@
+flask>=2.3.0
+aiohttp>=3.9.0
+pandas>=2.1.0
+# gunicorn>=21.2.0  # 可选：生产部署 WSGI/ASGI 容器
+
