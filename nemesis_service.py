@@ -195,6 +195,84 @@ class NemesisService:
         finally:
             conn.close()
 
+    def _strictly_defeats_event(
+        self,
+        target_single: int | None,
+        target_average: int | None,
+        candidate_single: int | None,
+        candidate_average: int | None,
+    ) -> bool:
+        if target_single is not None:
+            if candidate_single is None or candidate_single >= target_single:
+                return False
+        if target_average is not None:
+            if candidate_average is None or candidate_average >= target_average:
+                return False
+        return True
+
+    def _remove_tied_players(
+        self, candidate_ids: Set[str], single: Dict[str, int], average: Dict[str, int]
+    ) -> Set[str]:
+        if not candidate_ids:
+            return set()
+
+        all_events = set(single.keys()) | set(average.keys())
+        if not all_events:
+            return set(candidate_ids)
+
+        conn = self._get_conn()
+        try:
+            c = conn.cursor()
+            placeholders = ",".join(["?"] * len(candidate_ids))
+            event_placeholders = ",".join(["?"] * len(all_events))
+
+            c.execute(
+                f"""
+                SELECT person_id, event_id, best
+                FROM ranks_single
+                WHERE person_id IN ({placeholders})
+                  AND event_id IN ({event_placeholders})
+                  AND best > 0
+                """,
+                tuple(candidate_ids) + tuple(all_events),
+            )
+            single_records = {
+                (row["person_id"], row["event_id"]): row["best"] for row in c.fetchall()
+            }
+
+            c.execute(
+                f"""
+                SELECT person_id, event_id, best
+                FROM ranks_average
+                WHERE person_id IN ({placeholders})
+                  AND event_id IN ({event_placeholders})
+                  AND best > 0
+                """,
+                tuple(candidate_ids) + tuple(all_events),
+            )
+            average_records = {
+                (row["person_id"], row["event_id"]): row["best"] for row in c.fetchall()
+            }
+
+            verified: Set[str] = set()
+            for candidate_id in candidate_ids:
+                is_nemesis = True
+                for event_id in all_events:
+                    if not self._strictly_defeats_event(
+                        single.get(event_id),
+                        average.get(event_id),
+                        single_records.get((candidate_id, event_id)),
+                        average_records.get((candidate_id, event_id)),
+                    ):
+                        is_nemesis = False
+                        break
+                if is_nemesis:
+                    verified.add(candidate_id)
+
+            return verified
+        finally:
+            conn.close()
+
     def _get_people(self, ids: Set[str]) -> List[Dict[str, Any]]:
         if not ids:
             return []
@@ -230,6 +308,7 @@ class NemesisService:
     def query(self, person_id: str) -> Tuple[str, int, int, int, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         single, average, country = self._get_target_records(person_id)
         better_ids = self._filter_better_players(single, average)
+        better_ids = self._remove_tied_players(better_ids, single, average)
         people = self._get_people(better_ids)
 
         country_ids: Set[str] = set()
