@@ -1,8 +1,9 @@
 import asyncio
-import json
+import os
 import sqlite3
-import zipfile
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 from typing import Optional
 import aiohttp
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 class WCAUpdater:
     """WCA 数据库更新器（独立后端版本）"""
+    REPLACE_RETRY_COUNT = 5
+    REPLACE_RETRY_DELAY_SECONDS = 0.5
 
     def __init__(self, db_path: str | Path = DB_PATH):
         self.db_path = Path(db_path)
@@ -139,7 +142,13 @@ class WCAUpdater:
         except Exception as e:
             logger.warning(f"创建索引时出错（可忽略）: {e}")
 
-    def process_tsv_to_sqlite(self, tsv_archive_path: Path, export_date: str | None = None) -> bool:
+    def process_tsv_to_sqlite(
+        self,
+        tsv_archive_path: Path,
+        export_date: str | None = None,
+        target_db_path: str | Path | None = None,
+    ) -> bool:
+        db_path = Path(target_db_path) if target_db_path is not None else self.db_path
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir_path = Path(temp_dir)
@@ -148,7 +157,7 @@ class WCAUpdater:
                     zip_ref.extractall(temp_dir_path)
 
                 logger.info("开始处理 TSV 文件并转换为 SQLite 数据库...")
-                conn = sqlite3.connect(str(self.db_path))
+                conn = sqlite3.connect(str(db_path))
 
                 required_tables = [
                     "countries",
@@ -191,11 +200,42 @@ class WCAUpdater:
                         logger.warning(f"保存导出日期失败（可忽略）: {e}")
                 
                 conn.close()
-                logger.info("TSV 文件处理完成，SQLite 数据库已创建")
+                logger.info(f"TSV 文件处理完成，SQLite 数据库已创建: {db_path}")
                 return True
         except Exception as e:
             logger.error(f"处理 TSV 文件时出错: {e}")
             return False
+
+    def _create_temp_db_path(self) -> Path:
+        temp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".tmp.db",
+            dir=self.db_path.parent,
+        )
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+        temp_path.unlink(missing_ok=True)
+        return temp_path
+
+    def _replace_database_file(self, temp_db_path: Path) -> bool:
+        for attempt in range(1, self.REPLACE_RETRY_COUNT + 1):
+            try:
+                os.replace(temp_db_path, self.db_path)
+                logger.info(f"已用临时数据库替换正式数据库: {self.db_path}")
+                return True
+            except OSError as e:
+                if attempt == self.REPLACE_RETRY_COUNT:
+                    logger.error(f"替换正式数据库失败: {e}")
+                    return False
+                logger.warning(
+                    "替换正式数据库失败，第 %s/%s 次重试前等待 %.1f 秒: %s",
+                    attempt,
+                    self.REPLACE_RETRY_COUNT,
+                    self.REPLACE_RETRY_DELAY_SECONDS,
+                    e,
+                )
+                time.sleep(self.REPLACE_RETRY_DELAY_SECONDS)
+        return False
 
     async def update_database(self, force: bool = False) -> bool:
         # 如果不是强制更新，先检查是否需要更新
@@ -239,14 +279,29 @@ class WCAUpdater:
             logger.error("下载 TSV 压缩包失败")
             return False
 
+        temp_db_path = self._create_temp_db_path()
         try:
-            success = await asyncio.to_thread(self.process_tsv_to_sqlite, tsv_archive_path, export_info.get("export_date"))
-            if success:
-                if self.verify_database():
-                    logger.info("WCA 数据库更新成功并验证通过")
-                    return True
-                logger.error("WCA 数据库文件验证失败")
+            success = await asyncio.to_thread(
+                self.process_tsv_to_sqlite,
+                tsv_archive_path,
+                export_info.get("export_date"),
+                temp_db_path,
+            )
+            if not success:
                 return False
+
+            if not self.verify_database(temp_db_path):
+                logger.error("临时数据库文件验证失败")
+                return False
+
+            if not await asyncio.to_thread(self._replace_database_file, temp_db_path):
+                return False
+
+            if self.verify_database():
+                logger.info("WCA 数据库更新成功并验证通过")
+                return True
+
+            logger.error("正式数据库替换后验证失败")
             return False
         finally:
             try:
@@ -255,12 +310,19 @@ class WCAUpdater:
                     logger.info("已清理临时 TSV 压缩包文件")
             except Exception as e:
                 logger.warning(f"清理临时文件时出错: {e}")
+            try:
+                if temp_db_path.exists():
+                    temp_db_path.unlink()
+                    logger.info("已清理临时数据库文件")
+            except Exception as e:
+                logger.warning(f"清理临时数据库文件时出错: {e}")
 
-    def verify_database(self) -> bool:
-        if not self.db_path.exists():
+    def verify_database(self, db_path: str | Path | None = None) -> bool:
+        target_db_path = Path(db_path) if db_path is not None else self.db_path
+        if not target_db_path.exists():
             return False
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = sqlite3.connect(str(target_db_path))
             cursor = conn.cursor()
             required_tables = ["persons", "events", "competitions", "ranks_single", "ranks_average", "countries"]
             placeholders = ",".join(["?"] * len(required_tables))
@@ -274,21 +336,22 @@ class WCAUpdater:
             existing_tables = [row[0] for row in cursor.fetchall()]
             conn.close()
             if len(existing_tables) == len(required_tables):
-                logger.info("WCA 数据库验证通过")
+                logger.info(f"WCA 数据库验证通过: {target_db_path}")
                 return True
             missing = set(required_tables) - set(existing_tables)
-            logger.error(f"WCA 数据库缺少必要的表: {missing}")
+            logger.error(f"WCA 数据库缺少必要的表 {missing}: {target_db_path}")
             return False
         except Exception as e:
             logger.error(f"验证 WCA 数据库时出错: {e}")
             return False
 
-    def _get_local_export_date(self) -> str | None:
+    def _get_local_export_date(self, db_path: str | Path | None = None) -> str | None:
         """获取本地数据库的导出日期"""
-        if not self.db_path.exists():
+        target_db_path = Path(db_path) if db_path is not None else self.db_path
+        if not target_db_path.exists():
             return None
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = sqlite3.connect(str(target_db_path))
             cursor = conn.cursor()
             try:
                 cursor.execute("SELECT export_date FROM metadata LIMIT 1")
@@ -303,28 +366,7 @@ class WCAUpdater:
             logger.debug(f"获取本地导出日期失败: {e}")
             return None
 
-    def get_database_info(self) -> Optional[dict]:
-        if not self.db_path.exists():
-            return None
-        try:
-            conn = sqlite3.connect(str(self.db_path))
-            cursor = conn.cursor()
-            info = None
-            try:
-                cursor.execute("SELECT * FROM metadata")
-                metadata_row = cursor.fetchone()
-                if metadata_row:
-                    info = dict(zip([d[0] for d in cursor.description], metadata_row))
-            except sqlite3.OperationalError:
-                pass
-            mtime = self.db_path.stat().st_mtime
-            export_date = self._get_local_export_date()
-            conn.close()
-            result = info or {"file_mtime": mtime, "file_path": str(self.db_path)}
-            if export_date:
-                result["export_date"] = export_date
-            return result
-        except Exception as e:
-            logger.error(f"获取数据库信息时出错: {e}")
-            return None
+    def get_database_version(self) -> str | None:
+        """返回本地数据库记录的 WCA 导出日期。"""
+        return self._get_local_export_date()
 
