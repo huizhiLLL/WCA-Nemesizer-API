@@ -6,6 +6,7 @@ DB_PATH = Path(os.environ.get("WCA_DB_PATH", "data/wca_data.db"))
 
 # 下载与处理配置
 WCA_EXPORT_API = "https://www.worldcubeassociation.org/api/v0/export/public"
+WCA_EXPORT_PAGE = "https://www.worldcubeassociation.org/export/results"
 REQUEST_TIMEOUT = 600  # 秒
 CHUNKSIZE = 10000
 

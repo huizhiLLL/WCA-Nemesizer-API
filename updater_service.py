@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -10,7 +11,7 @@ import aiohttp
 import pandas as pd
 import logging
 
-from config import WCA_EXPORT_API, REQUEST_TIMEOUT, CHUNKSIZE, DB_PATH
+from config import WCA_EXPORT_API, WCA_EXPORT_PAGE, REQUEST_TIMEOUT, CHUNKSIZE, DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,38 @@ class WCAUpdater:
             logger.error(f"获取 WCA 导出信息异常: {e}")
             return None
 
+    async def get_export_page_download_links(self) -> Optional[dict]:
+        session = await self._ensure_session()
+        try:
+            async with session.get(WCA_EXPORT_PAGE) as response:
+                if response.status != 200:
+                    logger.error(f"获取 WCA 导出页失败，状态码：{response.status}")
+                    return None
+
+                html = await response.text()
+                tsv_match = re.search(
+                    r'https://assets\.worldcubeassociation\.org/export/results/[^"\']+\.tsv\.zip',
+                    html,
+                )
+                sql_match = re.search(
+                    r'https://assets\.worldcubeassociation\.org/export/results/[^"\']+\.sql\.zip',
+                    html,
+                )
+                if not tsv_match and not sql_match:
+                    logger.error("WCA 导出页中未找到静态下载链接")
+                    return None
+
+                return {
+                    "tsv_url": tsv_match.group(0) if tsv_match else None,
+                    "sql_url": sql_match.group(0) if sql_match else None,
+                }
+        except asyncio.TimeoutError:
+            logger.error(f"获取 WCA 导出页超时（{REQUEST_TIMEOUT}秒）")
+            return None
+        except Exception as e:
+            logger.error(f"获取 WCA 导出页异常: {e}")
+            return None
+
     async def download_tsv_archive(self, tsv_url: str) -> Optional[Path]:
         session = await self._ensure_session()
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -91,6 +124,39 @@ class WCAUpdater:
             logger.error(f"下载 WCA TSV 压缩包异常: {e}")
             temp_path.unlink(missing_ok=True)
             return None
+
+    async def _download_and_build_from_url(
+        self,
+        tsv_url: str,
+        export_date: str | None,
+        temp_db_path: Path,
+    ) -> bool:
+        tsv_archive_path = await self.download_tsv_archive(tsv_url)
+        if not tsv_archive_path:
+            logger.error("下载 TSV 压缩包失败")
+            return False
+
+        try:
+            success = await asyncio.to_thread(
+                self.process_tsv_to_sqlite,
+                tsv_archive_path,
+                export_date,
+                temp_db_path,
+            )
+            if not success:
+                return False
+
+            if not self.verify_database(temp_db_path):
+                logger.error("临时数据库文件验证失败")
+                return False
+            return True
+        finally:
+            try:
+                if tsv_archive_path.exists():
+                    tsv_archive_path.unlink()
+                    logger.info("已清理临时 TSV 压缩包文件")
+            except Exception as e:
+                logger.warning(f"清理临时文件时出错: {e}")
 
     def _find_tsv_file(self, temp_dir_path: Path, table: str) -> Path | None:
         patterns = [
@@ -390,25 +456,28 @@ class WCAUpdater:
             logger.error("WCA 导出信息中未找到 TSV 压缩包 URL")
             return False
 
-        tsv_archive_path = await self.download_tsv_archive(tsv_url)
-        if not tsv_archive_path:
-            logger.error("下载 TSV 压缩包失败")
-            return False
-
         temp_db_path = self._create_temp_db_path()
         try:
-            success = await asyncio.to_thread(
-                self.process_tsv_to_sqlite,
-                tsv_archive_path,
+            success = await self._download_and_build_from_url(
+                tsv_url,
                 export_info.get("export_date"),
                 temp_db_path,
             )
             if not success:
-                return False
-
-            if not self.verify_database(temp_db_path):
-                logger.error("临时数据库文件验证失败")
-                return False
+                page_links = await self.get_export_page_download_links()
+                fallback_tsv_url = page_links.get("tsv_url") if page_links else None
+                if fallback_tsv_url and fallback_tsv_url != tsv_url:
+                    logger.warning(
+                        "API 提供的 TSV 下载失败，尝试使用导出页静态链接回退: %s",
+                        fallback_tsv_url,
+                    )
+                    success = await self._download_and_build_from_url(
+                        fallback_tsv_url,
+                        export_info.get("export_date"),
+                        temp_db_path,
+                    )
+                if not success:
+                    return False
 
             if not await asyncio.to_thread(self._replace_database_file, temp_db_path):
                 return False
@@ -420,12 +489,6 @@ class WCAUpdater:
             logger.error("正式数据库替换后验证失败")
             return False
         finally:
-            try:
-                if tsv_archive_path.exists():
-                    tsv_archive_path.unlink()
-                    logger.info("已清理临时 TSV 压缩包文件")
-            except Exception as e:
-                logger.warning(f"清理临时文件时出错: {e}")
             try:
                 if temp_db_path.exists():
                     temp_db_path.unlink()

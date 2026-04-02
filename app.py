@@ -102,6 +102,10 @@ def nemesis_api():
         return jsonify({"error": "person_id is required"}), 400
     if not DB_PATH.exists():
         return jsonify({"error": f"database not found at {DB_PATH}"}), 500
+    updater = WCAUpdater(DB_PATH)
+    if not updater.verify_database():
+        trigger_update(force=False)
+        return jsonify({"error": "database unavailable, update in progress or last update failed"}), 503
     try:
         svc = get_nemesis_service()
         result = svc.query(person_id)
