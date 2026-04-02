@@ -123,24 +123,66 @@ class WCAUpdater:
     def _create_database_indexes(self, conn: sqlite3.Connection) -> None:
         logger.info("正在创建索引...")
         try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_persons_wca_id ON persons(wca_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_rankssingle_person_id ON ranks_single(person_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_rankssingle_event_id ON ranks_single(event_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ranksaverage_person_id ON ranks_average(person_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_id ON ranks_average(event_id)")
+            schema = self._detect_schema(conn)
+            single_person = schema["ranks_single"]["person"]
+            single_event = schema["ranks_single"]["event"]
+            average_person = schema["ranks_average"]["person"]
+            average_event = schema["ranks_average"]["event"]
+            persons_id = schema["persons"]["id"]
+            competitions_country = schema["competitions"]["country"]
+            competitions_start = schema["competitions"]["start"]
+            competitions_end = schema["competitions"]["end"]
+
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_persons_wca_id ON persons({persons_id})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_rankssingle_person_id ON ranks_single({single_person})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_rankssingle_event_id ON ranks_single({single_event})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_person_id ON ranks_average({average_person})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_id ON ranks_average({average_event})")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_competitions_id ON competitions(id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_competitions_country_id ON competitions(country_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_competitions_start_date ON competitions(start_date)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_competitions_end_date ON competitions(end_date)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best ON ranks_single(event_id, best)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best ON ranks_average(event_id, best)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best_person ON ranks_single(event_id, best, person_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best_person ON ranks_average(event_id, best, person_id)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_competitions_country_id ON competitions({competitions_country})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_competitions_start_date ON competitions({competitions_start})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_competitions_end_date ON competitions({competitions_end})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best ON ranks_single({single_event}, best)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best ON ranks_average({average_event}, best)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best_person ON ranks_single({single_event}, best, {single_person})")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best_person ON ranks_average({average_event}, best, {average_person})")
             conn.commit()
             logger.info("索引创建完成")
         except Exception as e:
             logger.warning(f"创建索引时出错（可忽略）: {e}")
+
+    def _detect_schema(self, conn: sqlite3.Connection) -> dict[str, dict[str, str]]:
+        return {
+            "persons": {
+                "id": self._resolve_column(conn, "persons", ("wca_id", "id")),
+            },
+            "ranks_single": {
+                "person": self._resolve_column(conn, "ranks_single", ("person_id", "personId")),
+                "event": self._resolve_column(conn, "ranks_single", ("event_id", "eventId")),
+            },
+            "ranks_average": {
+                "person": self._resolve_column(conn, "ranks_average", ("person_id", "personId")),
+                "event": self._resolve_column(conn, "ranks_average", ("event_id", "eventId")),
+            },
+            "competitions": {
+                "country": self._resolve_column(conn, "competitions", ("country_id", "countryId")),
+                "start": self._resolve_column(conn, "competitions", ("start_date", "year")),
+                "end": self._resolve_column(conn, "competitions", ("end_date", "year")),
+            },
+        }
+
+    def _resolve_column(
+        self, conn: sqlite3.Connection, table: str, candidates: tuple[str, ...]
+    ) -> str:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = {row[1] for row in rows}
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        raise sqlite3.OperationalError(
+            f"表 {table} 缺少预期字段，可选字段={candidates}，实际字段={sorted(columns)}"
+        )
 
     def process_tsv_to_sqlite(
         self,

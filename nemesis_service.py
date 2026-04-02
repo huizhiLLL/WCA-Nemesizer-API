@@ -62,23 +62,67 @@ class NemesisService:
         self.db_path = Path(db_path)
         if not self.db_path.exists():
             raise FileNotFoundError(f"WCA 数据库不存在: {db_path}")
+        self._schema = self._load_schema()
         self._ensure_indexes()
+
+    def _load_schema(self) -> Dict[str, Dict[str, str]]:
+        conn = self._get_conn()
+        try:
+            return {
+                "persons": {
+                    "id": self._resolve_column(conn, "persons", ("wca_id", "id")),
+                    "country": self._resolve_column(conn, "persons", ("country_id", "countryId")),
+                    "name": self._resolve_column(conn, "persons", ("name",)),
+                },
+                "ranks_single": {
+                    "person": self._resolve_column(conn, "ranks_single", ("person_id", "personId")),
+                    "event": self._resolve_column(conn, "ranks_single", ("event_id", "eventId")),
+                    "best": self._resolve_column(conn, "ranks_single", ("best",)),
+                },
+                "ranks_average": {
+                    "person": self._resolve_column(conn, "ranks_average", ("person_id", "personId")),
+                    "event": self._resolve_column(conn, "ranks_average", ("event_id", "eventId")),
+                    "best": self._resolve_column(conn, "ranks_average", ("best",)),
+                },
+                "countries": {
+                    "id": self._resolve_column(conn, "countries", ("id",)),
+                    "continent": self._resolve_column(conn, "countries", ("continent_id", "continentId")),
+                },
+            }
+        finally:
+            conn.close()
+
+    def _resolve_column(
+        self, conn: sqlite3.Connection, table: str, candidates: Tuple[str, ...]
+    ) -> str:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = {row["name"] for row in rows}
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        raise sqlite3.OperationalError(
+            f"表 {table} 缺少预期字段，可选字段={candidates}，实际字段={sorted(columns)}"
+        )
 
     def _ensure_indexes(self) -> None:
         conn = self._get_conn()
         try:
             c = conn.cursor()
+            single_event = self._schema["ranks_single"]["event"]
+            single_person = self._schema["ranks_single"]["person"]
+            average_event = self._schema["ranks_average"]["event"]
+            average_person = self._schema["ranks_average"]["person"]
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best ON ranks_single(event_id, best)"
+                f"CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best ON ranks_single({single_event}, best)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best ON ranks_average(event_id, best)"
+                f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best ON ranks_average({average_event}, best)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best_person ON ranks_single(event_id, best, person_id)"
+                f"CREATE INDEX IF NOT EXISTS idx_rankssingle_event_best_person ON ranks_single({single_event}, best, {single_person})"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best_person ON ranks_average(event_id, best, person_id)"
+                f"CREATE INDEX IF NOT EXISTS idx_ranksaverage_event_best_person ON ranks_average({average_event}, best, {average_person})"
             )
             conn.commit()
         finally:
@@ -93,21 +137,31 @@ class NemesisService:
         conn = self._get_conn()
         try:
             c = conn.cursor()
-            c.execute("SELECT country_id FROM persons WHERE wca_id = ?", (person_id,))
+            persons_id = self._schema["persons"]["id"]
+            persons_country = self._schema["persons"]["country"]
+            single_event = self._schema["ranks_single"]["event"]
+            single_person = self._schema["ranks_single"]["person"]
+            average_event = self._schema["ranks_average"]["event"]
+            average_person = self._schema["ranks_average"]["person"]
+
+            c.execute(
+                f"SELECT {persons_country} FROM persons WHERE {persons_id} = ?",
+                (person_id,),
+            )
             row = c.fetchone()
-            country = row["country_id"] if row else ""
+            country = row[persons_country] if row else ""
 
             c.execute(
-                "SELECT event_id, best FROM ranks_single WHERE person_id = ? AND best > 0",
+                f"SELECT {single_event} AS event_key, best FROM ranks_single WHERE {single_person} = ? AND best > 0",
                 (person_id,),
             )
-            single = {r["event_id"]: r["best"] for r in c.fetchall()}
+            single = {r["event_key"]: r["best"] for r in c.fetchall()}
 
             c.execute(
-                "SELECT event_id, best FROM ranks_average WHERE person_id = ? AND best > 0",
+                f"SELECT {average_event} AS event_key, best FROM ranks_average WHERE {average_person} = ? AND best > 0",
                 (person_id,),
             )
-            average = {r["event_id"]: r["best"] for r in c.fetchall()}
+            average = {r["event_key"]: r["best"] for r in c.fetchall()}
 
             return single, average, country
         finally:
@@ -137,19 +191,23 @@ class NemesisService:
             c = conn.cursor()
             candidates: Set[str] | None = None
             fetch_size = 10000
+            single_event = self._schema["ranks_single"]["event"]
+            single_person = self._schema["ranks_single"]["person"]
+            average_event = self._schema["ranks_average"]["event"]
+            average_person = self._schema["ranks_average"]["person"]
 
-            sql_single = """
-                SELECT person_id
+            sql_single = f"""
+                SELECT {single_person}
                 FROM ranks_single
-                WHERE event_id = ?
+                WHERE {single_event} = ?
                   AND best > 0
                   AND best < ?
             """
 
-            sql_average = """
-                SELECT person_id
+            sql_average = f"""
+                SELECT {average_person}
                 FROM ranks_average
-                WHERE event_id = ?
+                WHERE {average_event} = ?
                   AND best > 0
                   AND best < ?
             """
@@ -202,8 +260,18 @@ class NemesisService:
         try:
             c = conn.cursor()
             placeholders = ",".join(["?"] * len(ids))
+            persons_id = self._schema["persons"]["id"]
+            persons_country = self._schema["persons"]["country"]
+            persons_name = self._schema["persons"]["name"]
             c.execute(
-                f"SELECT wca_id, name, country_id FROM persons WHERE wca_id IN ({placeholders})",
+                f"""
+                SELECT
+                    {persons_id} AS wca_id,
+                    {persons_name} AS name,
+                    {persons_country} AS country_id
+                FROM persons
+                WHERE {persons_id} IN ({placeholders})
+                """,
                 tuple(ids),
             )
             return [dict(r) for r in c.fetchall()]
@@ -217,8 +285,16 @@ class NemesisService:
         try:
             c = conn.cursor()
             placeholders = ",".join(["?"] * len(country_ids))
+            country_id = self._schema["countries"]["id"]
+            continent_id = self._schema["countries"]["continent"]
             c.execute(
-                f"SELECT id, continent_id FROM countries WHERE id IN ({placeholders})",
+                f"""
+                SELECT
+                    {country_id} AS id,
+                    {continent_id} AS continent_id
+                FROM countries
+                WHERE {country_id} IN ({placeholders})
+                """,
                 tuple(country_ids),
             )
             return {row["id"]: row["continent_id"] for row in c.fetchall()}
