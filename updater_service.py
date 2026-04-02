@@ -19,6 +19,22 @@ class WCAUpdater:
     """WCA 数据库更新器（独立后端版本）"""
     REPLACE_RETRY_COUNT = 5
     REPLACE_RETRY_DELAY_SECONDS = 0.5
+    REQUIRED_TABLES = [
+        "countries",
+        "events",
+        "persons",
+        "competitions",
+        "ranks_single",
+        "ranks_average",
+    ]
+    EXPECTED_COLUMNS = {
+        "persons": [("wca_id", "id"), ("country_id", "countryId")],
+        "countries": [("id",), ("continent_id", "continentId")],
+        "competitions": [("id",), ("country_id", "countryId")],
+        "ranks_single": [("person_id", "personId"), ("event_id", "eventId"), ("best",)],
+        "ranks_average": [("person_id", "personId"), ("event_id", "eventId"), ("best",)],
+        "events": [("id",)],
+    }
 
     def __init__(self, db_path: str | Path = DB_PATH):
         self.db_path = Path(db_path)
@@ -89,6 +105,64 @@ class WCAUpdater:
                     return path
         return None
 
+    def _looks_like_error_header(self, columns: list[str]) -> bool:
+        joined = " | ".join(columns).lower()
+        error_markers = [
+            "error ",
+            "tls/ssl",
+            "hostname verification failed",
+            "access denied",
+            "exception",
+            "<html",
+            "<!doctype",
+        ]
+        return any(marker in joined for marker in error_markers)
+
+    def _validate_dataframe_columns(self, table_name: str, columns: list[str]) -> None:
+        if not columns:
+            raise ValueError(f"表 {table_name} 没有读取到任何列")
+        if self._looks_like_error_header(columns):
+            raise ValueError(f"表 {table_name} 的表头疑似错误响应，实际列={columns}")
+
+        for group in self.EXPECTED_COLUMNS.get(table_name, []):
+            if not any(candidate in columns for candidate in group):
+                raise ValueError(
+                    f"表 {table_name} 缺少关键字段，可选字段={group}，实际字段={columns}"
+                )
+
+    def _validate_database_schema(self, conn: sqlite3.Connection) -> bool:
+        try:
+            existing_tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            missing_tables = set(self.REQUIRED_TABLES) - existing_tables
+            if missing_tables:
+                logger.error(f"WCA 数据库缺少必要的表 {missing_tables}")
+                return False
+
+            for table_name, required_groups in self.EXPECTED_COLUMNS.items():
+                rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+                columns = [row[1] for row in rows]
+                if self._looks_like_error_header(columns):
+                    logger.error(f"表 %s 的表头疑似错误响应: %s", table_name, columns)
+                    return False
+                for group in required_groups:
+                    if not any(candidate in columns for candidate in group):
+                        logger.error(
+                            "表 %s 缺少关键字段，可选字段=%s，实际字段=%s",
+                            table_name,
+                            group,
+                            columns,
+                        )
+                        return False
+            return True
+        except Exception as e:
+            logger.error(f"校验数据库结构时出错: {e}")
+            return False
+
     def _process_single_table(self, conn: sqlite3.Connection, table_name: str, tsv_file: Path) -> bool:
         try:
             logger.info(f"正在处理表: {table_name}")
@@ -104,6 +178,10 @@ class WCAUpdater:
                 low_memory=False,
             ):
                 chunk_count += 1
+                if is_first_chunk:
+                    self._validate_dataframe_columns(
+                        table_name, [str(col) for col in chunk.columns.tolist()]
+                    )
                 total_rows += len(chunk)
                 if is_first_chunk:
                     chunk.to_sql(table_name, conn, if_exists="replace", index=False)
@@ -201,16 +279,7 @@ class WCAUpdater:
                 logger.info("开始处理 TSV 文件并转换为 SQLite 数据库...")
                 conn = sqlite3.connect(str(db_path))
 
-                required_tables = [
-                    "countries",
-                    "events",
-                    "persons",
-                    "competitions",
-                    "ranks_single",
-                    "ranks_average",
-                ]
-
-                for table_name in required_tables:
+                for table_name in self.REQUIRED_TABLES:
                     tsv_file = self._find_tsv_file(temp_dir_path, table_name)
                     if not tsv_file:
                         logger.warning(f"TSV 文件不存在: {table_name}.tsv")
@@ -218,6 +287,11 @@ class WCAUpdater:
                     if not self._process_single_table(conn, table_name, tsv_file):
                         conn.close()
                         return False
+
+                if not self._validate_database_schema(conn):
+                    conn.close()
+                    logger.error("TSV 导入完成后数据库结构校验失败")
+                    return False
 
                 self._create_database_indexes(conn)
                 
@@ -365,23 +439,12 @@ class WCAUpdater:
             return False
         try:
             conn = sqlite3.connect(str(target_db_path))
-            cursor = conn.cursor()
-            required_tables = ["persons", "events", "competitions", "ranks_single", "ranks_average", "countries"]
-            placeholders = ",".join(["?"] * len(required_tables))
-            cursor.execute(
-                f"""
-                SELECT name FROM sqlite_master 
-                WHERE type='table' AND name IN ({placeholders})
-                """,
-                required_tables,
-            )
-            existing_tables = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            if len(existing_tables) == len(required_tables):
+            if self._validate_database_schema(conn):
+                conn.close()
                 logger.info(f"WCA 数据库验证通过: {target_db_path}")
                 return True
-            missing = set(required_tables) - set(existing_tables)
-            logger.error(f"WCA 数据库缺少必要的表 {missing}: {target_db_path}")
+            conn.close()
+            logger.error(f"WCA 数据库结构验证失败: {target_db_path}")
             return False
         except Exception as e:
             logger.error(f"验证 WCA 数据库时出错: {e}")
