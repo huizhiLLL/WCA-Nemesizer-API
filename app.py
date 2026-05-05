@@ -17,7 +17,6 @@ _update_lock = threading.Lock()
 _update_running = False
 _periodic_thread: threading.Thread | None = None
 _periodic_stop = threading.Event()
-MAX_NEMESIS_LIST_SIZE = 10
 
 
 def get_nemesis_service() -> NemesisService:
@@ -87,9 +86,24 @@ def start_periodic_updates():
     _periodic_thread.start()
 
 
-def _maybe_return_nemesis_list(count: int, people: list[dict]) -> list[dict]:
-    """人数过多时不返回明细列表，避免响应体过大。"""
-    if count <= MAX_NEMESIS_LIST_SIZE:
+def _parse_nemesis_list_size(value) -> int | None:
+    """解析可选的宿敌明细返回上限；不传表示不限制。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("NEMESIS_LIST_SIZE must be a non-negative integer")
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("NEMESIS_LIST_SIZE must be a non-negative integer") from exc
+    if size < 0:
+        raise ValueError("NEMESIS_LIST_SIZE must be a non-negative integer")
+    return size
+
+
+def _maybe_return_nemesis_list(count: int, people: list[dict], limit: int | None) -> list[dict]:
+    """按请求上限决定是否返回明细列表；不传上限时返回全部。"""
+    if limit is None or count <= limit:
         return people
     return []
 
@@ -100,6 +114,10 @@ def nemesis_api():
     person_id = (data.get("person_id") or "").strip()
     if not person_id:
         return jsonify({"error": "person_id is required"}), 400
+    try:
+        nemesis_list_size = _parse_nemesis_list_size(data.get("NEMESIS_LIST_SIZE"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     if not DB_PATH.exists():
         return jsonify({"error": f"database not found at {DB_PATH}"}), 500
     updater = WCAUpdater(DB_PATH)
@@ -116,9 +134,9 @@ def nemesis_api():
                 "world_count": world_count,
                 "continent_count": continent_count,
                 "country_count": country_count,
-                "world_list": _maybe_return_nemesis_list(world_count, world_list),
-                "continent_list": _maybe_return_nemesis_list(continent_count, continent_list),
-                "country_list": _maybe_return_nemesis_list(country_count, country_list),
+                "world_list": _maybe_return_nemesis_list(world_count, world_list, nemesis_list_size),
+                "continent_list": _maybe_return_nemesis_list(continent_count, continent_list, nemesis_list_size),
+                "country_list": _maybe_return_nemesis_list(country_count, country_list, nemesis_list_size),
             }
         )
     except FileNotFoundError as e:
